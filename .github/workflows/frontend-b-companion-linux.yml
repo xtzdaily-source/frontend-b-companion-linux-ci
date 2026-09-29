@@ -60,15 +60,51 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          baseline="$RUNNER_TEMP/codex-stock/codex-rs/Cargo.lock"
-          baseline_sha="$(sha256sum "$baseline" | awk '{print $1}')"
+          baseline="$RUNNER_TEMP/Cargo.baseline.lock"
+          stock="$RUNNER_TEMP/codex-stock"
           stock_build="$RUNNER_TEMP/codex-stock-build"
           companion_build="$RUNNER_TEMP/codex-companion-build"
           metadata="$RUNNER_TEMP/cargo-metadata.json"
           normalized="$RUNNER_TEMP/Cargo.normalized.lock"
 
+          git -C codex show "$SOURCE_COMMIT:codex-rs/Cargo.lock" > "$baseline"
+          baseline_sha="$(sha256sum "$baseline" | awk '{print $1}')"
           git -C codex worktree add --detach "$stock_build" "$SOURCE_COMMIT"
-          test "$(sha256sum "$stock_build/codex-rs/Cargo.lock" | awk '{print $1}')" = "$baseline_sha"
+
+          fail_initial_lock_check() {
+            rc=$?
+            printf '%s\n' 'Cargo.lock canonical baseline verification failed' >&2
+            printf 'canonical_sha256=%s\n' "$baseline_sha" >&2
+            printf 'stock_sha256=%s\n' "$(sha256sum "$stock/codex-rs/Cargo.lock" | awk '{print $1}')" >&2
+            printf 'stock_build_sha256=%s\n' "$(sha256sum "$stock_build/codex-rs/Cargo.lock" | awk '{print $1}')" >&2
+            printf 'source_commit=%s\n' "$SOURCE_COMMIT" >&2
+            printf 'stock_head=%s\n' "$(git -C "$stock" rev-parse HEAD)" >&2
+            printf 'stock_build_head=%s\n' "$(git -C "$stock_build" rev-parse HEAD)" >&2
+            printf 'canonical_blob=%s\n' "$(git -C codex rev-parse "$SOURCE_COMMIT:codex-rs/Cargo.lock")" >&2
+            printf '%s\n' 'stock_status:' >&2
+            git -C "$stock" status --porcelain >&2
+            printf '%s\n' 'stock_build_status:' >&2
+            git -C "$stock_build" status --porcelain >&2
+            printf '%s\n' 'stock_index:' >&2
+            git -C "$stock" ls-files -s -- codex-rs/Cargo.lock >&2
+            printf 'stock_worktree_blob=%s\n' "$(git -C "$stock" hash-object codex-rs/Cargo.lock)" >&2
+            printf '%s\n' 'stock_build_index:' >&2
+            git -C "$stock_build" ls-files -s -- codex-rs/Cargo.lock >&2
+            printf 'stock_build_worktree_blob=%s\n' "$(git -C "$stock_build" hash-object codex-rs/Cargo.lock)" >&2
+            return "$rc"
+          }
+
+          stock_head="$(git -C "$stock" rev-parse HEAD)"
+          stock_build_head="$(git -C "$stock_build" rev-parse HEAD)"
+          stock_sha="$(sha256sum "$stock/codex-rs/Cargo.lock" | awk '{print $1}')"
+          stock_build_sha="$(sha256sum "$stock_build/codex-rs/Cargo.lock" | awk '{print $1}')"
+          if [[ "$stock_head" != "$SOURCE_COMMIT" || \
+                "$stock_build_head" != "$SOURCE_COMMIT" || \
+                "$stock_sha" != "$baseline_sha" || \
+                "$stock_build_sha" != "$baseline_sha" ]]; then
+            false
+          fi || fail_initial_lock_check
+
           (cd "$stock_build/codex-rs" && cargo +1.95.0 metadata --format-version 1 --no-deps > "$metadata")
           test "$(git -C "$stock_build" diff --name-only)" = "codex-rs/Cargo.lock"
 
@@ -83,6 +119,9 @@ jobs:
             --allow-to 0.146.0
 
           test "$(sha256sum "$baseline" | awk '{print $1}')" = "$baseline_sha"
+          test "$(sha256sum "$stock/codex-rs/Cargo.lock" | awk '{print $1}')" = "$baseline_sha"
+          test "$(git -C "$stock" rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git -C "$stock" status --porcelain)"
           test "$(sha256sum codex/codex-rs/Cargo.lock | awk '{print $1}')" = "$baseline_sha"
           git -C codex diff --exit-code -- codex-rs/Cargo.lock
 
@@ -108,7 +147,7 @@ jobs:
           STOCK_APP_SERVER: ${{ runner.temp }}/target-stock-diagnostic/release/codex-app-server
         run: |
           set -euo pipefail
-          stock="$RUNNER_TEMP/codex-stock"
+          stock="$STOCK_SOURCE"
           cleanup() {
             rc=$?
             git -C "$stock" restore --source=HEAD -- codex-rs/core/src/tools/spec_plan.rs
