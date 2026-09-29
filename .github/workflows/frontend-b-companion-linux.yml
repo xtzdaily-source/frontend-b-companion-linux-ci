@@ -30,6 +30,7 @@ jobs:
           test "$(uname -s)" = Linux
           test "$(uname -m)" = x86_64
           sha256sum -c ci/frontend-b-companion/expected/input-files.sha256
+          python3 ci/frontend-b-companion/lockfile/test_normalize_cargo_lock.py
 
       - name: Fetch fixed official source and apply only the frozen patch
         shell: bash
@@ -55,10 +56,55 @@ jobs:
           rustup toolchain install 1.95.0 --profile minimal --component rustfmt
           rustup run 1.95.0 rustc -Vv | tee "$RUNNER_TEMP/rustc-version.txt"
 
+      - name: Normalize and freeze Cargo.lock for Linux builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline="$RUNNER_TEMP/codex-stock/codex-rs/Cargo.lock"
+          baseline_sha="$(sha256sum "$baseline" | awk '{print $1}')"
+          stock_build="$RUNNER_TEMP/codex-stock-build"
+          companion_build="$RUNNER_TEMP/codex-companion-build"
+          metadata="$RUNNER_TEMP/cargo-metadata.json"
+          normalized="$RUNNER_TEMP/Cargo.normalized.lock"
+
+          git -C codex worktree add --detach "$stock_build" "$SOURCE_COMMIT"
+          test "$(sha256sum "$stock_build/codex-rs/Cargo.lock" | awk '{print $1}')" = "$baseline_sha"
+          (cd "$stock_build/codex-rs" && cargo +1.95.0 metadata --format-version 1 --no-deps > "$metadata")
+          test "$(git -C "$stock_build" diff --name-only)" = "codex-rs/Cargo.lock"
+
+          mkdir -p reports
+          python3 ci/frontend-b-companion/lockfile/normalize_cargo_lock.py \
+            --baseline "$baseline" \
+            --generated "$stock_build/codex-rs/Cargo.lock" \
+            --metadata "$metadata" \
+            --output "$normalized" \
+            --report reports/lockfile-normalization.json \
+            --allow-from 0.0.0 \
+            --allow-to 0.146.0
+
+          test "$(sha256sum "$baseline" | awk '{print $1}')" = "$baseline_sha"
+          test "$(sha256sum codex/codex-rs/Cargo.lock | awk '{print $1}')" = "$baseline_sha"
+          git -C codex diff --exit-code -- codex-rs/Cargo.lock
+
+          git -C codex worktree add --detach "$companion_build" "$SOURCE_COMMIT"
+          git -C "$companion_build" apply --check "$GITHUB_WORKSPACE/ci/frontend-b-companion/patches/frontend-b-companion-allowlist.patch"
+          git -C "$companion_build" apply "$GITHUB_WORKSPACE/ci/frontend-b-companion/patches/frontend-b-companion-allowlist.patch"
+          git -C "$companion_build" diff --check
+          git -C "$companion_build" diff --name-only | grep -v '^codex-rs/Cargo.lock$' | sort > "$RUNNER_TEMP/companion-build-changed-paths"
+          diff -u ci/frontend-b-companion/expected/authorized-source-paths.txt "$RUNNER_TEMP/companion-build-changed-paths"
+
+          install -m 0444 "$normalized" "$companion_build/codex-rs/Cargo.lock"
+          chmod a-w "$stock_build/codex-rs/Cargo.lock"
+          normalized_sha="$(sha256sum "$normalized" | awk '{print $1}')"
+          test "$(sha256sum "$stock_build/codex-rs/Cargo.lock" | awk '{print $1}')" = "$normalized_sha"
+          test "$(sha256sum "$companion_build/codex-rs/Cargo.lock" | awk '{print $1}')" = "$normalized_sha"
+          install -m 0444 "$normalized" reports/Cargo.normalized.lock
+          printf 'NORMALIZED_LOCK_SHA256=%s\n' "$normalized_sha" >> "$GITHUB_ENV"
+
       - name: Temporary stock search decision diagnostic
         shell: bash
         env:
-          STOCK_SOURCE: ${{ runner.temp }}/codex-stock
+          STOCK_SOURCE: ${{ runner.temp }}/codex-stock-build
           STOCK_APP_SERVER: ${{ runner.temp }}/target-stock-diagnostic/release/codex-app-server
         run: |
           set -euo pipefail
@@ -66,12 +112,16 @@ jobs:
           cleanup() {
             rc=$?
             git -C "$stock" restore --source=HEAD -- codex-rs/core/src/tools/spec_plan.rs
-            git -C "$stock" diff --exit-code
+            test "$(git -C "$stock" diff --name-only)" = "codex-rs/Cargo.lock"
+            test "$(sha256sum "$stock/codex-rs/Cargo.lock" | awk '{print $1}')" = "$NORMALIZED_LOCK_SHA256"
             exit "$rc"
           }
           trap cleanup EXIT
+          test "$(git -C "$stock" diff --name-only)" = "codex-rs/Cargo.lock"
           python3 ci/frontend-b-companion/acceptance/instrument_stock_search_tool.py "$stock"
-          test "$(git -C "$stock" diff --name-only)" = "codex-rs/core/src/tools/spec_plan.rs"
+          git -C "$stock" diff --name-only | sort > "$RUNNER_TEMP/stock-diagnostic-changed-paths"
+          printf '%s\n' codex-rs/Cargo.lock codex-rs/core/src/tools/spec_plan.rs > "$RUNNER_TEMP/stock-diagnostic-expected-paths"
+          diff -u "$RUNNER_TEMP/stock-diagnostic-expected-paths" "$RUNNER_TEMP/stock-diagnostic-changed-paths"
           export CARGO_TARGET_DIR="$RUNNER_TEMP/target-stock-diagnostic"
           (cd "$stock/codex-rs" && cargo +1.95.0 build --locked --release -p codex-app-server --bin codex-app-server)
           env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
@@ -83,21 +133,23 @@ jobs:
         run: |
           set -euo pipefail
           export CARGO_TARGET_DIR="$RUNNER_TEMP/target-companion"
-          cd codex/codex-rs
-          cargo +1.95.0 test --release -p codex-core --lib --features frontend_b_companion frontend_b_companion_final_registry_is_exactly_memory_search
-          cargo +1.95.0 build --release -p codex-app-server --bin codex-app-server --features frontend_b_companion
+          cd "$RUNNER_TEMP/codex-companion-build/codex-rs"
+          test "$(sha256sum Cargo.lock | awk '{print $1}')" = "$NORMALIZED_LOCK_SHA256"
+          cargo +1.95.0 test --locked --release -p codex-core --lib --features frontend_b_companion frontend_b_companion_final_registry_is_exactly_memory_search
+          cargo +1.95.0 build --locked --release -p codex-app-server --bin codex-app-server --features frontend_b_companion
           export CARGO_TARGET_DIR="$RUNNER_TEMP/target-stock"
-          cd "$RUNNER_TEMP/codex-stock/codex-rs"
+          cd "$RUNNER_TEMP/codex-stock-build/codex-rs"
+          test "$(sha256sum Cargo.lock | awk '{print $1}')" = "$NORMALIZED_LOCK_SHA256"
           cargo +1.95.0 build --locked --release -p codex-app-server --bin codex-app-server
 
       - name: Run isolated synthetic acceptance
         shell: bash
         env:
           COMPANION_ROOT: ${{ github.workspace }}
-          CODEX_SOURCE: ${{ github.workspace }}/codex
+          CODEX_SOURCE: ${{ runner.temp }}/codex-companion-build
           COMPANION_APP_SERVER: ${{ runner.temp }}/target-companion/release/codex-app-server
           STOCK_APP_SERVER: ${{ runner.temp }}/target-stock/release/codex-app-server
-          STOCK_SOURCE: ${{ runner.temp }}/codex-stock
+          STOCK_SOURCE: ${{ runner.temp }}/codex-stock-build
           STOCK_BASELINE_PATH: ${{ github.workspace }}/reports/stock-provider-schema.json
         run: |
           set -euo pipefail
@@ -124,7 +176,8 @@ jobs:
           file dist/codex-app-server | tee reports/file.txt
           ldd dist/codex-app-server | tee reports/ldd.txt
           sha256sum dist/codex-app-server dist/codex-compat-wrapper | tee reports/sha256sum.txt
-          printf 'source_commit=%s\npatch_sha256=%s\n' "$SOURCE_COMMIT" "$PATCH_SHA256" > reports/provenance.txt
+          printf 'source_commit=%s\npatch_sha256=%s\nnormalized_lock_sha256=%s\n' \
+            "$SOURCE_COMMIT" "$PATCH_SHA256" "$NORMALIZED_LOCK_SHA256" > reports/provenance.txt
           uname -a >> reports/provenance.txt
           cat /etc/os-release >> reports/provenance.txt
           cat "$RUNNER_TEMP/rustc-version.txt" >> reports/provenance.txt
@@ -141,4 +194,6 @@ jobs:
             reports/ldd.txt
             reports/sha256sum.txt
             reports/provenance.txt
+            reports/lockfile-normalization.json
+            reports/Cargo.normalized.lock
             reports/stock-provider-schema.json
