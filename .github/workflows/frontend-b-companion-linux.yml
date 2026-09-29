@@ -210,6 +210,17 @@ jobs:
             NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
             python3 ci/frontend-b-companion/acceptance/run_stock_search_diagnostic.py
 
+      - name: Restore exact companion Cargo intermediates
+        id: companion-target-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ${{ runner.temp }}/target-companion/release/.fingerprint
+            ${{ runner.temp }}/target-companion/release/build
+            ${{ runner.temp }}/target-companion/release/deps
+            ${{ runner.temp }}/target-companion/release/incremental
+          key: target-companion-source-${{ env.SOURCE_COMMIT }}-patch-${{ env.PATCH_SHA256 }}-lock-${{ env.NORMALIZED_LOCK_SHA256 }}-rust-1.95.0-linux-x86_64-feature-frontend_b_companion
+
       - name: Source unit gate and companion release build
         shell: bash
         run: |
@@ -218,7 +229,21 @@ jobs:
           cd "$RUNNER_TEMP/codex-companion-build/codex-rs"
           test "$(sha256sum Cargo.lock | awk '{print $1}')" = "$NORMALIZED_LOCK_SHA256"
           cargo +1.95.0 test --locked --release -p codex-core --lib --features frontend_b_companion frontend_b_companion_final_registry_is_exactly_memory_search
+          rm -f "$CARGO_TARGET_DIR/release/codex-app-server"
+          test ! -e "$CARGO_TARGET_DIR/release/codex-app-server"
           cargo +1.95.0 build --locked --release -p codex-app-server --bin codex-app-server --features frontend_b_companion
+          test -x "$CARGO_TARGET_DIR/release/codex-app-server"
+
+      - name: Save exact companion Cargo intermediates
+        if: steps.companion-target-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ${{ runner.temp }}/target-companion/release/.fingerprint
+            ${{ runner.temp }}/target-companion/release/build
+            ${{ runner.temp }}/target-companion/release/deps
+            ${{ runner.temp }}/target-companion/release/incremental
+          key: target-companion-source-${{ env.SOURCE_COMMIT }}-patch-${{ env.PATCH_SHA256 }}-lock-${{ env.NORMALIZED_LOCK_SHA256 }}-rust-1.95.0-linux-x86_64-feature-frontend_b_companion
 
       - name: Run isolated synthetic acceptance
         shell: bash

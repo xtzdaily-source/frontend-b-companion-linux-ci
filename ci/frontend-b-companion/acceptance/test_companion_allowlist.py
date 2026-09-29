@@ -8,6 +8,7 @@ input media types only, never prompt text or credentials.
 """
 from __future__ import annotations
 
+import hashlib
 import http.server
 import json
 import os
@@ -64,6 +65,39 @@ PATCH_PATHS = {
     "codex-rs/core/src/tools/spec_plan.rs",
     "codex-rs/core/src/tools/spec_plan_tests.rs",
 }
+NORMALIZED_LOCK_PATH = "codex-rs/Cargo.lock"
+
+
+def assert_normalized_companion_source(testcase: unittest.TestCase, source: Path = SOURCE):
+    changed = subprocess.run(
+        ["git", "diff", "--name-only"], cwd=source, check=True,
+        capture_output=True, text=True,
+    ).stdout.splitlines()
+    changed_paths = set(changed)
+    testcase.assertIn(
+        NORMALIZED_LOCK_PATH,
+        changed_paths,
+        "normalized Cargo.lock is absent from the companion build worktree diff",
+    )
+    testcase.assertEqual(
+        changed_paths - {NORMALIZED_LOCK_PATH},
+        PATCH_PATHS,
+        "non-lock source changes are not exactly the isolated six-file allowlist patch",
+    )
+    expected_lock_sha = os.environ.get("NORMALIZED_LOCK_SHA256", "")
+    testcase.assertRegex(
+        expected_lock_sha,
+        r"^[0-9a-f]{64}$",
+        "NORMALIZED_LOCK_SHA256 is absent or malformed",
+    )
+    actual_lock_sha = hashlib.sha256(
+        (source / NORMALIZED_LOCK_PATH).read_bytes()
+    ).hexdigest()
+    testcase.assertEqual(
+        actual_lock_sha,
+        expected_lock_sha,
+        "companion build worktree does not use the authenticated normalized Cargo.lock",
+    )
 
 
 def safe_text(value: str) -> str:
@@ -443,11 +477,7 @@ class CompanionAllowlistAcceptance(unittest.TestCase):
     def test_public_thread_config_removes_execution_schemas_on_start_resume_and_each_turn(self):
         with CAPTURE_LOCK:
             CAPTURED.clear()
-        changed = subprocess.run(
-            ["git", "diff", "--name-only"], cwd=SOURCE, check=True,
-            capture_output=True, text=True,
-        ).stdout.splitlines()
-        self.assertEqual(set(changed), PATCH_PATHS, "source changes escaped the isolated allowlist patch")
+        assert_normalized_companion_source(self, SOURCE)
 
         home = self.root / "persistent"
         config_text = config_for(home, self.base_url)
