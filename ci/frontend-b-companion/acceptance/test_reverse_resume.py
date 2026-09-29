@@ -23,6 +23,7 @@ class ReverseResume(unittest.TestCase):
         self.root = tempfile.TemporaryDirectory(prefix="frontend-b-reverse-")
         self.home = Path(self.root.name) / "codex-home"
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/v1"
+        m.config_for(self.home, self.url)
 
     def tearDown(self):
         self.httpd.shutdown(); self.httpd.server_close(); self.root.cleanup()
