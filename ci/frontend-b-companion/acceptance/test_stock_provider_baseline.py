@@ -56,6 +56,20 @@ def tool_search_definition(value, inside=False):
     return None
 
 
+def require_native_tool_search(specs, label):
+    identities = [
+        {"type": leaf.get("type"), "name": leaf.get("name")}
+        for _, leaf in m.leaf_tools(specs)
+    ]
+    native = [
+        identity for identity in identities
+        if identity == {"type": "tool_search", "name": None}
+    ]
+    if len(native) != 1:
+        raise SystemExit(f"{label} lacks one native type=tool_search/name=null entry: {identities}")
+    return identities
+
+
 def write_stock_startup_config(home, base_url, catalog_path):
     """Write the complete, startup-only stock configuration before app launch."""
     home.mkdir(parents=True, exist_ok=True)
@@ -147,8 +161,7 @@ def main():
         finally:
             app.close(); server.shutdown(); server.server_close()
     if len(CAPTURES) != 2: raise SystemExit(f"expected two provider requests, got {len(CAPTURES)}")
-    first = [leaf.get("name") for _, leaf in m.leaf_tools(CAPTURES[0].get("tools", []))]
-    if "tool_search" not in first: raise SystemExit(f"stock first request lacks tool_search: {first}")
+    require_native_tool_search(CAPTURES[0].get("tools", []), "stock first request")
     baseline = tool_search_definition(CAPTURES[1].get("input", []))
     if baseline is None: raise SystemExit("stock tool_search output omitted memory_search definition")
     report = Path(os.environ["STOCK_BASELINE_PATH"])

@@ -4,7 +4,6 @@ import http.server
 import importlib.util
 import json
 import os
-import re
 import tempfile
 import threading
 from pathlib import Path
@@ -14,25 +13,6 @@ spec = importlib.util.spec_from_file_location("stock_baseline", HERE / "test_sto
 baseline = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(baseline)
-
-
-def decision_line(lines):
-    marker = "FRONTEND_B_STOCK_DIAG search_tool_enabled "
-    matched = [line for line in lines if marker in line]
-    if not matched:
-        raise SystemExit("stock diagnostic emitted no decision line")
-    parsed = []
-    for line in matched:
-        fields = dict(re.findall(r"(slug|supports_search_tool|namespace_tools|enabled)=(\"[^\"]*\"|true|false)", line))
-        if set(fields) != {"slug", "supports_search_tool", "namespace_tools", "enabled"}:
-            raise SystemExit("stock diagnostic line was malformed")
-        fields["slug"] = fields["slug"].strip('"')
-        for name in ("supports_search_tool", "namespace_tools", "enabled"):
-            fields[name] = fields[name] == "true"
-        parsed.append(fields)
-    if any(item != parsed[0] for item in parsed[1:]):
-        raise SystemExit("stock diagnostic decision values were inconsistent within one turn")
-    return parsed[0]
 
 
 def main() -> None:
@@ -68,16 +48,26 @@ def main() -> None:
                 requests = list(baseline.m.CAPTURED)
             if len(requests) != 1:
                 raise SystemExit(f"diagnostic expected one provider request, got {len(requests)}")
-            tools = [leaf.get("name") for _, leaf in baseline.m.leaf_tools(requests[0].get("tools", []))]
-            result = {"runnerRuntime": runtime, "turnDecision": decision_line(app.stderr_lines), "providerTools": tools}
+            tools = baseline.require_native_tool_search(
+                requests[0].get("tools", []), "stock diagnostic provider request"
+            )
+            turn = {
+                "slug": runtime["config"]["model"],
+                "supports_search_tool": runtime["derivedCatalog"]["supportsSearchTool"],
+                "namespace_tools": runtime["capabilities"]["namespaceTools"],
+                "enabled": any(
+                    tool == {"type": "tool_search", "name": None}
+                    for tool in tools
+                ),
+            }
+            result = {"runnerRuntime": runtime, "turnDecision": turn, "providerTools": tools}
             print(json.dumps(result, sort_keys=True))
-            turn = result["turnDecision"]
             if not turn["supports_search_tool"]:
                 raise SystemExit("diagnostic mismatch: turn ModelInfo supports_search_tool=false")
             if not turn["namespace_tools"]:
                 raise SystemExit("diagnostic mismatch: turn provider namespace_tools=false")
-            if not turn["enabled"] or "tool_search" not in tools:
-                raise SystemExit("diagnostic assembly mismatch: search enabled but tool_search absent")
+            if not turn["enabled"]:
+                raise SystemExit("diagnostic mismatch: turn search_tool_enabled=false")
     finally:
         if app is not None:
             app.close()
