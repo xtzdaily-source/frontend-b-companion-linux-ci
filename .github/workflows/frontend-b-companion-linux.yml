@@ -72,7 +72,7 @@ jobs:
           git -C codex worktree add --detach "$stock_build" "$SOURCE_COMMIT"
 
           fail_initial_lock_check() {
-            rc=$?
+            printf '%s\n' 'INITIAL_VERIFY_FAIL' >&2
             printf '%s\n' 'Cargo.lock canonical baseline verification failed' >&2
             printf 'canonical_sha256=%s\n' "$baseline_sha" >&2
             printf 'stock_sha256=%s\n' "$(sha256sum "$stock/codex-rs/Cargo.lock" | awk '{print $1}')" >&2
@@ -91,22 +91,35 @@ jobs:
             printf '%s\n' 'stock_build_index:' >&2
             git -C "$stock_build" ls-files -s -- codex-rs/Cargo.lock >&2
             printf 'stock_build_worktree_blob=%s\n' "$(git -C "$stock_build" hash-object codex-rs/Cargo.lock)" >&2
-            return "$rc"
+            return 1
           }
 
-          stock_head="$(git -C "$stock" rev-parse HEAD)"
-          stock_build_head="$(git -C "$stock_build" rev-parse HEAD)"
-          stock_sha="$(sha256sum "$stock/codex-rs/Cargo.lock" | awk '{print $1}')"
-          stock_build_sha="$(sha256sum "$stock_build/codex-rs/Cargo.lock" | awk '{print $1}')"
-          if [[ "$stock_head" != "$SOURCE_COMMIT" || \
-                "$stock_build_head" != "$SOURCE_COMMIT" || \
-                "$stock_sha" != "$baseline_sha" || \
-                "$stock_build_sha" != "$baseline_sha" ]]; then
-            false
-          fi || fail_initial_lock_check
+          if ! {
+            stock_head="$(git -C "$stock" rev-parse HEAD)" &&
+            stock_build_head="$(git -C "$stock_build" rev-parse HEAD)" &&
+            stock_sha="$(sha256sum "$stock/codex-rs/Cargo.lock" | awk '{print $1}')" &&
+            stock_build_sha="$(sha256sum "$stock_build/codex-rs/Cargo.lock" | awk '{print $1}')" &&
+            [[ "$stock_head" = "$SOURCE_COMMIT" ]] &&
+            [[ "$stock_build_head" = "$SOURCE_COMMIT" ]] &&
+            [[ "$stock_sha" = "$baseline_sha" ]] &&
+            [[ "$stock_build_sha" = "$baseline_sha" ]]
+          }; then
+            fail_initial_lock_check
+          fi
 
-          (cd "$stock_build/codex-rs" && cargo +1.95.0 metadata --format-version 1 --no-deps > "$metadata")
-          test "$(git -C "$stock_build" diff --name-only)" = "codex-rs/Cargo.lock"
+          if ! (cd "$stock_build/codex-rs" && cargo +1.95.0 metadata --format-version 1 > "$metadata"); then
+            printf '%s\n' 'LOCK_GENERATION_FAIL' >&2
+            exit 1
+          fi
+          lock_diff="$(git -C "$stock_build" diff --name-only)"
+          if [[ "$lock_diff" != "codex-rs/Cargo.lock" ]]; then
+            printf '%s\n' 'EXPECTED_LOCK_DIFF_FAIL' >&2
+            printf 'actual_changed_paths=%s\n' "$lock_diff" >&2
+            printf 'canonical_sha256=%s\n' "$baseline_sha" >&2
+            printf 'generated_sha256=%s\n' "$(sha256sum "$stock_build/codex-rs/Cargo.lock" | awk '{print $1}')" >&2
+            git -C "$stock_build" status --porcelain >&2
+            exit 1
+          fi
 
           mkdir -p reports
           python3 ci/frontend-b-companion/lockfile/normalize_cargo_lock.py \
