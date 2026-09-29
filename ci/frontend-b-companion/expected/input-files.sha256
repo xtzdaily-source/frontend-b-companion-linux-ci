@@ -1,0 +1,3 @@
+0127ab21290ef89c4accc3588d3b71d9f4c14305b43c330367b72ade958f51e8  ci/frontend-b-companion/patches/frontend-b-companion-allowlist.patch
+f45190555b9422eb65f23e8fb5867e501c9d3ad1b1b46ad859fc0b0d7fe60f05  ci/frontend-b-companion/acceptance/test_companion_allowlist.py
+e6876ec723d22cf50596639c07c9828e1b76580155d48ce1bf7db36a6824c043  ci/frontend-b-companion/acceptance/mock_memory_search_mcp.py

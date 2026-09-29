@@ -1,0 +1,184 @@
+diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
+index cf02f023c..a7e06ace3 100644
+--- a/codex-rs/app-server/Cargo.toml
++++ b/codex-rs/app-server/Cargo.toml
+@@ -21,6 +21,9 @@ name = "codex_app_server"
+ path = "src/lib.rs"
+ doctest = false
+ 
++[features]
++frontend_b_companion = ["codex-core/frontend_b_companion"]
++
+ [lints]
+ workspace = true
+ 
+diff --git a/codex-rs/core/Cargo.toml b/codex-rs/core/Cargo.toml
+index 3eac8f03e..f82221687 100644
+--- a/codex-rs/core/Cargo.toml
++++ b/codex-rs/core/Cargo.toml
+@@ -8,6 +8,9 @@ version.workspace = true
+ name = "codex_core"
+ path = "src/lib.rs"
+ 
++[features]
++frontend_b_companion = []
++
+ [[bin]]
+ name = "codex-write-config-schema"
+ path = "src/bin/config_schema.rs"
+diff --git a/codex-rs/core/src/tools/handlers/mcp.rs b/codex-rs/core/src/tools/handlers/mcp.rs
+index 7cadbcf0c..428aab11d 100644
+--- a/codex-rs/core/src/tools/handlers/mcp.rs
++++ b/codex-rs/core/src/tools/handlers/mcp.rs
+@@ -164,6 +164,13 @@ impl McpHandler {
+ }
+ 
+ impl CoreToolRuntime for McpHandler {
++    #[cfg(feature = "frontend_b_companion")]
++    fn is_frontend_b_companion_allowlisted(&self) -> bool {
++        self.tool_info.server_name == "memory_search"
++            && self.tool_info.tool.name == "memory_search"
++            && self.tool_info.connector_id.is_none()
++    }
++
+     fn telemetry_tags<'a>(
+         &'a self,
+         _invocation: &'a ToolInvocation,
+diff --git a/codex-rs/core/src/tools/registry.rs b/codex-rs/core/src/tools/registry.rs
+index 3000c518b..6e6045284 100644
+--- a/codex-rs/core/src/tools/registry.rs
++++ b/codex-rs/core/src/tools/registry.rs
+@@ -50,6 +50,11 @@ pub use codex_tools::ToolExposure;
+ /// Implementers provide the shared `ToolExecutor` behavior plus optional
+ /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
+ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
++    #[cfg(feature = "frontend_b_companion")]
++    fn is_frontend_b_companion_allowlisted(&self) -> bool {
++        false
++    }
++
+     fn matches_kind(&self, payload: &ToolPayload) -> bool {
+         matches!(
+             payload,
+@@ -282,6 +287,11 @@ impl ToolExecutor<ToolInvocation> for ExposureOverride {
+ }
+ 
+ impl CoreToolRuntime for ExposureOverride {
++    #[cfg(feature = "frontend_b_companion")]
++    fn is_frontend_b_companion_allowlisted(&self) -> bool {
++        self.handler.is_frontend_b_companion_allowlisted()
++    }
++
+     fn matches_kind(&self, payload: &ToolPayload) -> bool {
+         self.handler.matches_kind(payload)
+     }
+diff --git a/codex-rs/core/src/tools/spec_plan.rs b/codex-rs/core/src/tools/spec_plan.rs
+index 5ff9e392f..c6f6a973d 100644
+--- a/codex-rs/core/src/tools/spec_plan.rs
++++ b/codex-rs/core/src/tools/spec_plan.rs
+@@ -248,6 +248,17 @@ fn build_model_visible_specs_and_registry(
+         runtimes,
+         hosted_specs,
+     } = planned_tools;
++    #[cfg(feature = "frontend_b_companion")]
++    let runtimes = runtimes
++        .into_iter()
++        .filter(|runtime| runtime.is_frontend_b_companion_allowlisted())
++        .map(|runtime| override_tool_exposure(runtime, ToolExposure::Direct))
++        .collect::<Vec<_>>();
++    #[cfg(feature = "frontend_b_companion")]
++    let hosted_specs = {
++        let _ = hosted_specs;
++        Vec::new()
++    };
+     let mut specs = Vec::new();
+     let mut seen_tool_names = HashSet::new();
+     for runtime in &runtimes {
+@@ -280,6 +291,20 @@ fn build_model_visible_specs_and_registry(
+     (model_visible_specs, registry)
+ }
+ 
++#[cfg(feature = "frontend_b_companion")]
++fn spec_for_model_request(
++    _turn_context: &TurnContext,
++    _exposure: ToolExposure,
++    _tool_name: &ToolName,
++    spec: ToolSpec,
++) -> ToolSpec {
++    // The dedicated companion build only exposes its explicit allowlist. Keep
++    // those provider-visible specs faithful to their source instead of adding
++    // Code Mode execution declarations to their descriptions.
++    spec
++}
++
++#[cfg(not(feature = "frontend_b_companion"))]
+ fn spec_for_model_request(
+     turn_context: &TurnContext,
+     exposure: ToolExposure,
+diff --git a/codex-rs/core/src/tools/spec_plan_tests.rs b/codex-rs/core/src/tools/spec_plan_tests.rs
+index 87be4d927..927ddb8ce 100644
+--- a/codex-rs/core/src/tools/spec_plan_tests.rs
++++ b/codex-rs/core/src/tools/spec_plan_tests.rs
+@@ -1000,6 +1000,62 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
+     ]);
+ }
+ 
++#[cfg(feature = "frontend_b_companion")]
++#[tokio::test]
++async fn frontend_b_companion_final_registry_is_exactly_memory_search() {
++    let plan = probe_with(
++        |turn| set_feature(turn, Feature::CodeMode, true),
++        ToolPlanInputs {
++            tool_runtimes: vec![
++                mcp_runtime(
++                    "memory_search",
++                    "mcp__memory_search",
++                    "memory_search",
++                    ToolExposure::Deferred,
++                ),
++                mcp_runtime(
++                    "filesystem",
++                    "mcp__filesystem",
++                    "read_file",
++                    ToolExposure::Direct,
++                ),
++            ],
++            dynamic_tools: vec![dynamic_tool(None, "unlisted_dynamic", false)],
++            ..ToolPlanInputs::default()
++        },
++    )
++    .await;
++
++    let memory_search_name =
++        ToolName::namespaced("mcp__memory_search", "memory_search").to_string();
++    assert_eq!(plan.registered_names, [memory_search_name.clone()]);
++    assert_eq!(plan.exposure(&memory_search_name), ToolExposure::Direct);
++    assert_eq!(
++        plan.namespace_function_names("mcp__memory_search"),
++        ["memory_search"]
++    );
++    assert_eq!(plan.visible_specs.len(), 1);
++    assert!(!plan.visible_names.iter().any(|name| name == "tool_search"));
++
++    let ToolSpec::Namespace(namespace) = &plan.visible_specs[0] else {
++        panic!("expected the memory_search namespace spec");
++    };
++    assert_eq!(namespace.name, "mcp__memory_search");
++    assert_eq!(namespace.tools.len(), 1);
++    let codex_tools::ResponsesApiNamespaceTool::Function(memory_search) = &namespace.tools[0];
++    assert_eq!(memory_search.name, "memory_search");
++    assert_eq!(memory_search.description, "memory_search test tool");
++    assert_eq!(
++        serde_json::to_value(&memory_search.parameters).expect("schema should serialize"),
++        json!({
++            "type": "object",
++            "properties": {},
++            "additionalProperties": false,
++        })
++    );
++    assert_eq!(memory_search.defer_loading, None);
++}
++
+ #[tokio::test]
+ async fn deferred_extension_tools_are_discoverable_with_tool_search() {
+     let plan = probe_with(

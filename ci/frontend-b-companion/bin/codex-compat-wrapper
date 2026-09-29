@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 5 ] ||
+   [ "$1" != "app-server" ] ||
+   [ "$2" != "--stdio" ] ||
+   [ "$3" != "--strict-config" ] ||
+   [ "$4" != "-c" ] ||
+   [ "$5" != "analytics.enabled=false" ]; then
+  exit 64
+fi
+
+exec "$(dirname "$0")/codex-app-server" --listen stdio:// --strict-config -c analytics.enabled=false

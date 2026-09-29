@@ -1,0 +1,144 @@
+name: frontend-b-companion-linux
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      RUSTUP_HOME: ${{ github.workspace }}/.ci/rustup
+      CARGO_HOME: ${{ github.workspace }}/.ci/cargo
+      CARGO_TERM_COLOR: never
+      GIT_TERMINAL_PROMPT: "0"
+      SOURCE_COMMIT: e363b08c9175ac1cbe5893615dd2cb9ddf95043b
+      PATCH_SHA256: 0127ab21290ef89c4accc3588d3b71d9f4c14305b43c330367b72ade958f51e8
+
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        with:
+          persist-credentials: false
+
+      - name: Assert runner platform and frozen CI inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          sha256sum -c ci/frontend-b-companion/expected/input-files.sha256
+
+      - name: Fetch fixed official source and apply only the frozen patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --no-checkout https://github.com/openai/codex.git codex
+          git -C codex fetch --depth=1 origin "$SOURCE_COMMIT"
+          git -C codex checkout --detach FETCH_HEAD
+          test "$(git -C codex rev-parse HEAD)" = "$SOURCE_COMMIT"
+          git -C codex worktree add --detach "$RUNNER_TEMP/codex-stock" "$SOURCE_COMMIT"
+          test "$(sha256sum ci/frontend-b-companion/patches/frontend-b-companion-allowlist.patch | awk '{print $1}')" = "$PATCH_SHA256"
+          git -C codex apply --check "$GITHUB_WORKSPACE/ci/frontend-b-companion/patches/frontend-b-companion-allowlist.patch"
+          git -C codex apply "$GITHUB_WORKSPACE/ci/frontend-b-companion/patches/frontend-b-companion-allowlist.patch"
+          git -C codex diff --check
+          git -C codex diff --name-only | sort > "$RUNNER_TEMP/changed-paths"
+          diff -u ci/frontend-b-companion/expected/authorized-source-paths.txt "$RUNNER_TEMP/changed-paths"
+          git -C codex diff --exit-code -- codex-rs/Cargo.lock
+
+      - name: Install isolated Rust 1.95.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          rustup run 1.95.0 rustc -Vv | tee "$RUNNER_TEMP/rustc-version.txt"
+
+      - name: Temporary stock search decision diagnostic
+        shell: bash
+        env:
+          STOCK_SOURCE: ${{ runner.temp }}/codex-stock
+          STOCK_APP_SERVER: ${{ runner.temp }}/target-stock-diagnostic/release/codex-app-server
+        run: |
+          set -euo pipefail
+          stock="$RUNNER_TEMP/codex-stock"
+          cleanup() {
+            rc=$?
+            git -C "$stock" restore --source=HEAD -- codex-rs/core/src/tools/spec_plan.rs
+            git -C "$stock" diff --exit-code
+            exit "$rc"
+          }
+          trap cleanup EXIT
+          python3 ci/frontend-b-companion/acceptance/instrument_stock_search_tool.py "$stock"
+          test "$(git -C "$stock" diff --name-only)" = "codex-rs/core/src/tools/spec_plan.rs"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/target-stock-diagnostic"
+          (cd "$stock/codex-rs" && cargo +1.95.0 build --locked --release -p codex-app-server --bin codex-app-server)
+          env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+            NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+            python3 ci/frontend-b-companion/acceptance/run_stock_search_diagnostic.py
+
+      - name: Source unit gate and release builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/target-companion"
+          cd codex/codex-rs
+          cargo +1.95.0 test --release -p codex-core --lib --features frontend_b_companion frontend_b_companion_final_registry_is_exactly_memory_search
+          cargo +1.95.0 build --release -p codex-app-server --bin codex-app-server --features frontend_b_companion
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/target-stock"
+          cd "$RUNNER_TEMP/codex-stock/codex-rs"
+          cargo +1.95.0 build --locked --release -p codex-app-server --bin codex-app-server
+
+      - name: Run isolated synthetic acceptance
+        shell: bash
+        env:
+          COMPANION_ROOT: ${{ github.workspace }}
+          CODEX_SOURCE: ${{ github.workspace }}/codex
+          COMPANION_APP_SERVER: ${{ runner.temp }}/target-companion/release/codex-app-server
+          STOCK_APP_SERVER: ${{ runner.temp }}/target-stock/release/codex-app-server
+          STOCK_SOURCE: ${{ runner.temp }}/codex-stock
+          STOCK_BASELINE_PATH: ${{ github.workspace }}/reports/stock-provider-schema.json
+        run: |
+          set -euo pipefail
+          env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+            NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+            python3 ci/frontend-b-companion/acceptance/test_stock_provider_baseline.py
+          env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+            NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+            python3 ci/frontend-b-companion/acceptance/run_existing_suite.py
+          env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+            NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+            python3 ci/frontend-b-companion/acceptance/test_reverse_resume.py
+          python3 ci/frontend-b-companion/bin/test_codex_compat_wrapper.py
+
+      - name: Generate ELF and provenance report
+        shell: bash
+        env:
+          COMPANION_APP_SERVER: ${{ runner.temp }}/target-companion/release/codex-app-server
+        run: |
+          set -euo pipefail
+          mkdir -p dist reports
+          install -m 0755 "$COMPANION_APP_SERVER" dist/codex-app-server
+          install -m 0755 ci/frontend-b-companion/bin/codex-compat-wrapper dist/codex-compat-wrapper
+          file dist/codex-app-server | tee reports/file.txt
+          ldd dist/codex-app-server | tee reports/ldd.txt
+          sha256sum dist/codex-app-server dist/codex-compat-wrapper | tee reports/sha256sum.txt
+          printf 'source_commit=%s\npatch_sha256=%s\n' "$SOURCE_COMMIT" "$PATCH_SHA256" > reports/provenance.txt
+          uname -a >> reports/provenance.txt
+          cat /etc/os-release >> reports/provenance.txt
+          cat "$RUNNER_TEMP/rustc-version.txt" >> reports/provenance.txt
+
+      - name: Upload verified Linux artifact and provenance
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: frontend-b-companion-codex-linux-x86_64-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            dist/codex-app-server
+            dist/codex-compat-wrapper
+            reports/file.txt
+            reports/ldd.txt
+            reports/sha256sum.txt
+            reports/provenance.txt
+            reports/stock-provider-schema.json

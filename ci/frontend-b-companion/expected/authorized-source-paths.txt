@@ -1,0 +1,6 @@
+codex-rs/app-server/Cargo.toml
+codex-rs/core/Cargo.toml
+codex-rs/core/src/tools/handlers/mcp.rs
+codex-rs/core/src/tools/registry.rs
+codex-rs/core/src/tools/spec_plan.rs
+codex-rs/core/src/tools/spec_plan_tests.rs
