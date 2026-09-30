@@ -145,13 +145,18 @@ class Provider(http.server.BaseHTTPRequestHandler):
         request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
         type(self).requests.append(request)
         sequence = len(type(self).requests)
-        if sequence == 1:
-            target = {
-                "dangerous": "exec_command",
-                "memory": "memory_search",
-                "second": "weather",
-            }[type(self).mode]
-            matches = [(namespace, tool) for namespace, tool in leaf_tools(request.get("tools", [])) if tool.get("name") == target]
+        mode = type(self).mode
+        target = {
+            "dangerous": "exec_command",
+            "memory": "memory_search",
+            "second": "weather",
+        }[mode]
+        if sequence == 1 and mode == "dangerous":
+            matches = [
+                (namespace, tool)
+                for namespace, tool in leaf_tools(request.get("tools", []))
+                if tool.get("name") == target
+            ]
             if len(matches) != 1:
                 raise AssertionError(f"{target} schema count is not one: {matches}")
             namespace, _tool = matches[0]
@@ -163,7 +168,60 @@ class Provider(http.server.BaseHTTPRequestHandler):
             }
             if namespace:
                 item["namespace"] = namespace
+        elif sequence == 1:
+            tool_search = [
+                tool
+                for tool in request.get("tools", [])
+                if tool.get("type") == "tool_search"
+            ]
+            if len(tool_search) != 1:
+                raise AssertionError(f"tool_search schema count is not one: {tool_search}")
+            if any(tool.get("name") == target for _namespace, tool in leaf_tools(request.get("tools", []))):
+                raise AssertionError(f"deferred {target} was exposed directly before search")
+            item = {
+                "type": "tool_search_call",
+                "call_id": f"v2-search-{target}",
+                "execution": "client",
+                "arguments": {"query": target, "limit": 8},
+            }
+        elif sequence == 2 and mode in {"memory", "second"}:
+            search_outputs = [
+                item
+                for item in request.get("input", [])
+                if item.get("type") == "tool_search_output"
+                and item.get("call_id") == f"v2-search-{target}"
+            ]
+            if len(search_outputs) != 1:
+                raise AssertionError(f"{target} tool_search output count is not one: {search_outputs}")
+            expected_namespace = {
+                "memory": "mcp__memory_search",
+                "second": "mcp__second_synthetic",
+            }[mode]
+            matches = [
+                (namespace, tool)
+                for namespace, tool in leaf_tools(search_outputs[0].get("tools", []))
+                if tool.get("name") == target
+            ]
+            if len(matches) != 1:
+                raise AssertionError(f"{target} deferred schema count is not one: {matches}")
+            if matches[0][0] != expected_namespace:
+                raise AssertionError(
+                    f"{target} deferred namespace is {matches[0][0]!r}, expected {expected_namespace!r}"
+                )
+            if matches[0][1].get("defer_loading") is not True:
+                raise AssertionError(f"{target} schema was not marked defer_loading")
+            item = {
+                "type": "function_call",
+                "call_id": f"v2-call-{target}",
+                "namespace": expected_namespace,
+                "name": target,
+                "arguments": json.dumps({"query": "synthetic"}),
+            }
         else:
+            if mode in {"memory", "second"}:
+                output = json.dumps(request.get("input", []))
+                if f"synthetic:{target}:ok" not in output:
+                    raise AssertionError(f"{target} result missing from provider input")
             item = {
                 "id": f"v2-message-{sequence}",
                 "type": "message",
@@ -242,12 +300,21 @@ def run_turn(mode: str, policy: Path, work: Path, with_image: bool = False):
         app.close()
         server.shutdown()
         server.server_close()
-    if len(Provider.requests) != 2:
-        raise AssertionError(f"{mode}: expected two provider requests, got {len(Provider.requests)}")
+    expected_requests = 2 if mode == "dangerous" else 3
+    if len(Provider.requests) != expected_requests:
+        raise AssertionError(
+            f"{mode}: expected {expected_requests} provider requests, got {len(Provider.requests)}"
+        )
     return Provider.requests
 
 
 def runtime_gates(work: Path):
+    for policy in (POLICY, POLICY_SECOND):
+        policy_text = policy.read_text(encoding="utf-8")
+        allowed_local_tools = policy_text.split("allowed_local_tools = [", 1)[1].split("]", 1)[0]
+        if '"tool_search"' not in allowed_local_tools:
+            raise AssertionError(f"tool_search is not explicitly allowed by {policy.name}")
+
     dangerous = run_turn("dangerous", POLICY, work)
     schemas = list(leaf_tools(dangerous[0].get("tools", [])))
     if not any(tool.get("name") == "exec_command" for _namespace, tool in schemas):
@@ -258,13 +325,13 @@ def runtime_gates(work: Path):
         raise AssertionError("hosted/provider web_search was exposed")
 
     memory = run_turn("memory", POLICY, work, with_image=True)
-    if "synthetic:memory_search:ok" not in json.dumps(memory[1].get("input", [])):
+    if "synthetic:memory_search:ok" not in json.dumps(memory[2].get("input", [])):
         raise AssertionError("memory_search did not execute successfully")
     if "input_image" not in json.dumps(memory[0].get("input", [])):
         raise AssertionError("image input did not reach the synthetic provider")
 
     second = run_turn("second", POLICY_SECOND, work)
-    if "synthetic:weather:ok" not in json.dumps(second[1].get("input", [])):
+    if "synthetic:weather:ok" not in json.dumps(second[2].get("input", [])):
         raise AssertionError("second MCP was not enabled by policy-only change")
 
 
