@@ -33,6 +33,7 @@ jobs:
           test "$(uname -m)" = x86_64
           sha256sum -c ci/execution-disabled-companion-v2/expected/input-files.sha256
           python3 ci/execution-disabled-companion-v2/lockfile/test_normalize_cargo_lock.py
+          python3 ci/execution-disabled-companion-v2/harness/test_verify_changed_paths.py
           test "$(sha256sum "$PATCH_PATH" | awk '{print $1}')" = "$PATCH_SHA256"
 
       - name: Fetch frozen official source and apply only v2 patch
@@ -57,8 +58,10 @@ jobs:
           git -C "$build" apply --check "$GITHUB_WORKSPACE/$PATCH_PATH"
           git -C "$build" apply "$GITHUB_WORKSPACE/$PATCH_PATH"
           git -C "$build" diff --check
-          git -C "$build" diff --name-only | sort > "$RUNNER_TEMP/v2-changed-paths"
-          diff -u ci/execution-disabled-companion-v2/expected/authorized-source-paths.txt "$RUNNER_TEMP/v2-changed-paths"
+          python3 ci/execution-disabled-companion-v2/harness/verify_changed_paths.py \
+            --repo "$build" \
+            --expect ci/execution-disabled-companion-v2/expected/authorized-source-paths.txt \
+            --output "$RUNNER_TEMP/v2-changed-paths"
           test "$(sha256sum "$build/codex-rs/Cargo.lock" | awk '{print $1}')" = "$baseline_lock_sha"
           git -C "$build" diff --exit-code -- codex-rs/Cargo.lock
           printf 'BASELINE_LOCK_SHA256=%s\n' "$baseline_lock_sha" >> "$GITHUB_ENV"
@@ -109,12 +112,14 @@ jobs:
             printf '%s\n' 'LOCK_GENERATION_FAIL' >&2
             exit 1
           fi
-          git -C "$build" diff --name-only | sort > "$RUNNER_TEMP/v2-changed-paths-with-lock"
           {
             cat ci/execution-disabled-companion-v2/expected/authorized-source-paths.txt
             printf '%s\n' codex-rs/Cargo.lock
           } | sort > "$RUNNER_TEMP/v2-expected-paths-with-lock"
-          diff -u "$RUNNER_TEMP/v2-expected-paths-with-lock" "$RUNNER_TEMP/v2-changed-paths-with-lock"
+          python3 ci/execution-disabled-companion-v2/harness/verify_changed_paths.py \
+            --repo "$build" \
+            --expect "$RUNNER_TEMP/v2-expected-paths-with-lock" \
+            --output "$RUNNER_TEMP/v2-changed-paths-with-lock"
 
           python3 ci/execution-disabled-companion-v2/lockfile/normalize_cargo_lock.py \
             --baseline "$canonical" \
