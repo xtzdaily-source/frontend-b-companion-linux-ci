@@ -1,5 +1,5 @@
 dd04702ae23cd2d3a4301447fa80e9111d8da90148a1fa60c73ed7e9c324e1c7  .github/workflows/execution-disabled-companion-v2-linux.yml
-646c95f73c79e0a1b187cb660e735f33cd4b1859529c074114445bff0ee2d24e  ci/execution-disabled-companion-v2/patches/execution-disabled-companion-v2.patch
+e9063e1b63adaa1e2f711f1102fb9c426a8670ad72dfa1d65b6e23e6d73175fd  ci/execution-disabled-companion-v2/patches/execution-disabled-companion-v2.patch
 face3b7b82a9ac87929879278f105b681d682698a1e6cd0052ffa2b7babe2ecc  ci/execution-disabled-companion-v2/expected/authorized-source-paths.txt
 ef7befbda502f0472e7960f87460ebac4b892d3ce5dc89ea05588a39b4a5f202  ci/execution-disabled-companion-v2/policy/companion-exec-policy.toml
 8fa5e852d43d9054a1723f92b955448d7e9bcc9139e7790fc62910b6a2ebf08f  ci/execution-disabled-companion-v2/policy/companion-exec-policy-second-mcp.toml

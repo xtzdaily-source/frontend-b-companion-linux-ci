@@ -447,8 +447,9 @@ index 0000000000..ee12d35ebb
 +            .is_ok()
 +    );
 +    let wrong_connector = RuntimeOrigin::Mcp {
++        server: "future".into(),
++        raw_tool: "weather".into(),
 +        connector: None,
-+        ..future
 +    };
 +    assert!(
 +        policy
