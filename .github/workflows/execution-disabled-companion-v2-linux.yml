@@ -159,10 +159,17 @@ jobs:
           export CARGO_TARGET_DIR="$RUNNER_TEMP/target-v2"
           rm -f "$CARGO_TARGET_DIR/release/codex-app-server"
           cd "$RUNNER_TEMP/codex-v2-build/codex-rs"
+          normalized_lock_before="$(sha256sum Cargo.lock | awk '{print $1}')"
+          test "$normalized_lock_before" = "$NORMALIZED_LOCK_SHA256"
+          test "$(sha256sum "$RUNNER_TEMP/codex-v2-baseline/codex-rs/Cargo.lock" | awk '{print $1}')" = "$BASELINE_LOCK_SHA256"
+          test -z "$(git -C "$RUNNER_TEMP/codex-v2-baseline" status --porcelain)"
           cargo +1.95.0 build --locked --release -p codex-app-server --bin codex-app-server --features "$FEATURE"
           test -x "$CARGO_TARGET_DIR/release/codex-app-server"
-          test "$(sha256sum Cargo.lock | awk '{print $1}')" = "$NORMALIZED_LOCK_SHA256"
-          git -C .. diff --exit-code -- codex-rs/Cargo.lock
+          normalized_lock_after="$(sha256sum Cargo.lock | awk '{print $1}')"
+          test "$normalized_lock_after" = "$normalized_lock_before"
+          test "$normalized_lock_after" = "$NORMALIZED_LOCK_SHA256"
+          test "$(sha256sum "$RUNNER_TEMP/codex-v2-baseline/codex-rs/Cargo.lock" | awk '{print $1}')" = "$BASELINE_LOCK_SHA256"
+          test -z "$(git -C "$RUNNER_TEMP/codex-v2-baseline" status --porcelain)"
 
       - name: Run root-owned policy synthetic E2E
         shell: bash

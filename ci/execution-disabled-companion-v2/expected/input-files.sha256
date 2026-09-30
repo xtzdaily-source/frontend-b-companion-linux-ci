@@ -1,4 +1,4 @@
-325c16e499adb9e002b2e386cae0cca7c3f066a0eb45c886e155ba636465ffae  .github/workflows/execution-disabled-companion-v2-linux.yml
+d79e2ab2b7b6d4a552e060e88e6434310bddd2d8be812691282d716930abafb5  .github/workflows/execution-disabled-companion-v2-linux.yml
 7f0508fdd4793a17e74537eb162fb740cff11543fc76c986d32f6a7ca3a4a13d  ci/execution-disabled-companion-v2/patches/execution-disabled-companion-v2.patch
 face3b7b82a9ac87929879278f105b681d682698a1e6cd0052ffa2b7babe2ecc  ci/execution-disabled-companion-v2/expected/authorized-source-paths.txt
 ef7befbda502f0472e7960f87460ebac4b892d3ce5dc89ea05588a39b4a5f202  ci/execution-disabled-companion-v2/policy/companion-exec-policy.toml
