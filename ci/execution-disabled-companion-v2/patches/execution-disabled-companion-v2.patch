@@ -347,10 +347,10 @@ index 0000000000..3666ad51bd
 +pub(crate) mod tests;
 diff --git a/codex-rs/core/src/companion_execution_policy_tests.rs b/codex-rs/core/src/companion_execution_policy_tests.rs
 new file mode 100644
-index 0000000000..ee12d35ebb
+index 0000000000..93bb1133f0
 --- /dev/null
 +++ b/codex-rs/core/src/companion_execution_policy_tests.rs
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,156 @@
 +use super::*;
 +use std::io::Write;
 +

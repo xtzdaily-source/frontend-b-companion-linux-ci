@@ -17,7 +17,7 @@ jobs:
       GIT_TERMINAL_PROMPT: "0"
       SOURCE_COMMIT: e363b08c9175ac1cbe5893615dd2cb9ddf95043b
       PATCH_PATH: ci/execution-disabled-companion-v2/patches/execution-disabled-companion-v2.patch
-      PATCH_SHA256: e9063e1b63adaa1e2f711f1102fb9c426a8670ad72dfa1d65b6e23e6d73175fd
+      PATCH_SHA256: 7f0508fdd4793a17e74537eb162fb740cff11543fc76c986d32f6a7ca3a4a13d
       FEATURE: execution-disabled-companion
 
     steps:
@@ -34,6 +34,7 @@ jobs:
           sha256sum -c ci/execution-disabled-companion-v2/expected/input-files.sha256
           python3 ci/execution-disabled-companion-v2/lockfile/test_normalize_cargo_lock.py
           python3 ci/execution-disabled-companion-v2/harness/test_verify_changed_paths.py
+          python3 ci/execution-disabled-companion-v2/harness/test_verify_patch_integrity.py
           test "$(sha256sum "$PATCH_PATH" | awk '{print $1}')" = "$PATCH_SHA256"
 
       - name: Fetch frozen official source and apply only v2 patch
@@ -47,6 +48,9 @@ jobs:
           git -C "$baseline" checkout --detach FETCH_HEAD
           test "$(git -C "$baseline" rev-parse HEAD)" = "$SOURCE_COMMIT"
           test -z "$(git -C "$baseline" status --porcelain)"
+          python3 ci/execution-disabled-companion-v2/harness/verify_patch_integrity.py \
+            --source-repo "$baseline" \
+            --patch "$GITHUB_WORKSPACE/$PATCH_PATH"
           git -C "$baseline" worktree add --detach "$build" "$SOURCE_COMMIT"
           test "$(git -C "$build" rev-parse HEAD)" = "$SOURCE_COMMIT"
           test -z "$(git -C "$build" status --porcelain)"
