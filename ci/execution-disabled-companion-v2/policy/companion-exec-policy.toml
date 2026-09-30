@@ -1,0 +1,17 @@
+version = 1
+default_action = "deny"
+hosted_tools = "disabled"
+
+allowed_local_tools = [
+  "current_time",
+  "get_context_remaining",
+  "list_mcp_resources",
+  "list_mcp_resource_templates",
+  "read_mcp_resource",
+  "tool_search",
+  "view_image",
+]
+
+[[allowed_mcp_tools]]
+server = "memory_search"
+raw_tool = "memory_search"

@@ -1,0 +1,206 @@
+name: execution-disabled-companion-v2-linux
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      RUSTUP_HOME: ${{ github.workspace }}/.ci/rustup
+      CARGO_HOME: ${{ github.workspace }}/.ci/cargo
+      CARGO_TERM_COLOR: never
+      GIT_TERMINAL_PROMPT: "0"
+      SOURCE_COMMIT: e363b08c9175ac1cbe5893615dd2cb9ddf95043b
+      PATCH_PATH: ci/execution-disabled-companion-v2/patches/execution-disabled-companion-v2.patch
+      PATCH_SHA256: 646c95f73c79e0a1b187cb660e735f33cd4b1859529c074114445bff0ee2d24e
+      FEATURE: execution-disabled-companion
+
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        with:
+          persist-credentials: false
+
+      - name: Assert runner and frozen CI inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          sha256sum -c ci/execution-disabled-companion-v2/expected/input-files.sha256
+          python3 ci/execution-disabled-companion-v2/lockfile/test_normalize_cargo_lock.py
+          test "$(sha256sum "$PATCH_PATH" | awk '{print $1}')" = "$PATCH_SHA256"
+
+      - name: Fetch frozen official source and apply only v2 patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline="$RUNNER_TEMP/codex-v2-baseline"
+          build="$RUNNER_TEMP/codex-v2-build"
+          git clone --no-checkout https://github.com/openai/codex.git "$baseline"
+          git -C "$baseline" fetch --depth=1 origin "$SOURCE_COMMIT"
+          git -C "$baseline" checkout --detach FETCH_HEAD
+          test "$(git -C "$baseline" rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git -C "$baseline" status --porcelain)"
+          git -C "$baseline" worktree add --detach "$build" "$SOURCE_COMMIT"
+          test "$(git -C "$build" rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git -C "$build" status --porcelain)"
+          canonical_lock="$RUNNER_TEMP/Cargo.v2.baseline.lock"
+          git -C "$baseline" show "$SOURCE_COMMIT:codex-rs/Cargo.lock" > "$canonical_lock"
+          baseline_lock_sha="$(sha256sum "$canonical_lock" | awk '{print $1}')"
+          test "$(sha256sum "$baseline/codex-rs/Cargo.lock" | awk '{print $1}')" = "$baseline_lock_sha"
+          test "$(sha256sum "$build/codex-rs/Cargo.lock" | awk '{print $1}')" = "$baseline_lock_sha"
+          git -C "$build" apply --check "$GITHUB_WORKSPACE/$PATCH_PATH"
+          git -C "$build" apply "$GITHUB_WORKSPACE/$PATCH_PATH"
+          git -C "$build" diff --check
+          git -C "$build" diff --name-only | sort > "$RUNNER_TEMP/v2-changed-paths"
+          diff -u ci/execution-disabled-companion-v2/expected/authorized-source-paths.txt "$RUNNER_TEMP/v2-changed-paths"
+          test "$(sha256sum "$build/codex-rs/Cargo.lock" | awk '{print $1}')" = "$baseline_lock_sha"
+          git -C "$build" diff --exit-code -- codex-rs/Cargo.lock
+          printf 'BASELINE_LOCK_SHA256=%s\n' "$baseline_lock_sha" >> "$GITHUB_ENV"
+
+      - name: Assert frozen runtime-policy contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          policy="$RUNNER_TEMP/codex-v2-build/codex-rs/core/src/companion_execution_policy.rs"
+          grep -F 'execution_disabled_by_runtime_policy' "$policy"
+          grep -F 'symlink_metadata' "$policy"
+          grep -F 'mode == 0o644' "$policy"
+          grep -F 'RuntimeOrigin::Mcp' "$policy"
+          registry="$RUNNER_TEMP/codex-v2-build/codex-rs/core/src/tools/registry.rs"
+          gate_line="$(grep -n 'authorize_registered_runtime' "$registry" | tail -1 | cut -d: -f1)"
+          hook_line="$(grep -n 'notify_tool_start' "$registry" | tail -1 | cut -d: -f1)"
+          handler_line="$(grep -n 'handle_any_tool(tool.as_ref()' "$registry" | cut -d: -f1)"
+          test "$gate_line" -lt "$hook_line"
+          test "$hook_line" -lt "$handler_line"
+
+      - name: Install isolated Rust 1.95.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          rustup run 1.95.0 rustc -Vv | tee "$RUNNER_TEMP/rustc-version.txt"
+
+      - name: Normalize and freeze Cargo.lock with structured provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline_repo="$RUNNER_TEMP/codex-v2-baseline"
+          build="$RUNNER_TEMP/codex-v2-build"
+          canonical="$RUNNER_TEMP/Cargo.v2.baseline.lock"
+          metadata="$RUNNER_TEMP/v2-metadata.json"
+          normalized="$RUNNER_TEMP/Cargo.v2.normalized.lock"
+          report="$GITHUB_WORKSPACE/reports/v2-lockfile-normalization.json"
+          mkdir -p "$GITHUB_WORKSPACE/reports"
+
+          test "$(git -C "$baseline_repo" rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test "$(git -C "$build" rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git -C "$baseline_repo" status --porcelain)"
+          test "$(sha256sum "$canonical" | awk '{print $1}')" = "$BASELINE_LOCK_SHA256"
+          test "$(sha256sum "$baseline_repo/codex-rs/Cargo.lock" | awk '{print $1}')" = "$BASELINE_LOCK_SHA256"
+          test "$(sha256sum "$build/codex-rs/Cargo.lock" | awk '{print $1}')" = "$BASELINE_LOCK_SHA256"
+
+          if ! (cd "$build/codex-rs" && cargo +1.95.0 metadata --format-version 1 > "$metadata"); then
+            printf '%s\n' 'LOCK_GENERATION_FAIL' >&2
+            exit 1
+          fi
+          git -C "$build" diff --name-only | sort > "$RUNNER_TEMP/v2-changed-paths-with-lock"
+          {
+            cat ci/execution-disabled-companion-v2/expected/authorized-source-paths.txt
+            printf '%s\n' codex-rs/Cargo.lock
+          } | sort > "$RUNNER_TEMP/v2-expected-paths-with-lock"
+          diff -u "$RUNNER_TEMP/v2-expected-paths-with-lock" "$RUNNER_TEMP/v2-changed-paths-with-lock"
+
+          python3 ci/execution-disabled-companion-v2/lockfile/normalize_cargo_lock.py \
+            --baseline "$canonical" \
+            --generated "$build/codex-rs/Cargo.lock" \
+            --metadata "$metadata" \
+            --output "$normalized" \
+            --report "$report" \
+            --allow-from 0.0.0 \
+            --allow-to 0.146.0
+          normalized_sha="$(sha256sum "$normalized" | awk '{print $1}')"
+          test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["normalized_sha256"])' "$report")" = "$normalized_sha"
+          install -m 0444 "$normalized" "$build/codex-rs/Cargo.lock"
+          test "$(sha256sum "$build/codex-rs/Cargo.lock" | awk '{print $1}')" = "$normalized_sha"
+          test "$(sha256sum "$baseline_repo/codex-rs/Cargo.lock" | awk '{print $1}')" = "$BASELINE_LOCK_SHA256"
+          test -z "$(git -C "$baseline_repo" status --porcelain)"
+          install -m 0444 "$normalized" reports/Cargo.v2.normalized.lock
+          printf 'NORMALIZED_LOCK_SHA256=%s\n' "$normalized_sha" >> "$GITHUB_ENV"
+
+      - name: Run v2 policy loader dispatch registry and spec-plan tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/codex-v2-build/codex-rs"
+          cargo +1.95.0 test --locked -p codex-core --features "$FEATURE" companion_execution_policy
+          cargo +1.95.0 test --locked -p codex-core --features "$FEATURE" execution_policy_denies_visible_dangerous_schema_before_handler
+          cargo +1.95.0 test --locked -p codex-core --features "$FEATURE" execution_disabled_companion_keeps_hosted_tools_closed
+          test "$(sha256sum Cargo.lock | awk '{print $1}')" = "$NORMALIZED_LOCK_SHA256"
+
+      - name: Build v2 app-server from frozen source and patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/target-v2"
+          rm -f "$CARGO_TARGET_DIR/release/codex-app-server"
+          cd "$RUNNER_TEMP/codex-v2-build/codex-rs"
+          cargo +1.95.0 build --locked --release -p codex-app-server --bin codex-app-server --features "$FEATURE"
+          test -x "$CARGO_TARGET_DIR/release/codex-app-server"
+          test "$(sha256sum Cargo.lock | awk '{print $1}')" = "$NORMALIZED_LOCK_SHA256"
+          git -C .. diff --exit-code -- codex-rs/Cargo.lock
+
+      - name: Run root-owned policy synthetic E2E
+        shell: bash
+        env:
+          V2_APP_SERVER: ${{ runner.temp }}/target-v2/release/codex-app-server
+        run: |
+          set -euo pipefail
+          trap 'sudo rm -f /etc/tidal-codex-poc/companion-exec-policy.toml' EXIT
+          sudo install -d -o root -g root -m 0755 /etc/tidal-codex-poc
+          env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+            NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+            python3 ci/execution-disabled-companion-v2/harness/test_v2_runtime.py
+
+      - name: Generate ELF and provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist reports
+          install -m 0555 "$RUNNER_TEMP/target-v2/release/codex-app-server" dist/codex-app-server
+          file dist/codex-app-server | tee reports/file.txt
+          ldd dist/codex-app-server | tee reports/ldd.txt
+          sha256sum dist/codex-app-server | tee reports/sha256sum.txt
+          {
+            printf 'schema=1\n'
+            printf 'source_commit=%s\n' "$SOURCE_COMMIT"
+            printf 'patch_sha256=%s\n' "$PATCH_SHA256"
+            printf 'canonical_cargo_lock_sha256=%s\n' "$BASELINE_LOCK_SHA256"
+            printf 'normalized_cargo_lock_sha256=%s\n' "$NORMALIZED_LOCK_SHA256"
+            printf 'rust=1.95.0\n'
+            printf 'platform=linux-x86_64\n'
+            printf 'feature=%s\n' "$FEATURE"
+            printf 'hosted_tools=disabled\n'
+          } > reports/provenance.txt
+          cat "$RUNNER_TEMP/rustc-version.txt" >> reports/provenance.txt
+          uname -a >> reports/provenance.txt
+          cat /etc/os-release >> reports/provenance.txt
+
+      - name: Upload verified v2 Linux artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: execution-disabled-companion-v2-linux-x86_64-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            dist/codex-app-server
+            reports/file.txt
+            reports/ldd.txt
+            reports/sha256sum.txt
+            reports/provenance.txt
+            reports/v2-lockfile-normalization.json
+            reports/Cargo.v2.normalized.lock

@@ -1,0 +1,12 @@
+codex-rs/app-server/Cargo.toml
+codex-rs/app-server/companion-exec-policy.example.toml
+codex-rs/app-server/src/main.rs
+codex-rs/core/Cargo.toml
+codex-rs/core/src/companion_execution_policy.rs
+codex-rs/core/src/companion_execution_policy_tests.rs
+codex-rs/core/src/lib.rs
+codex-rs/core/src/tools/handlers/mcp.rs
+codex-rs/core/src/tools/registry.rs
+codex-rs/core/src/tools/registry_tests.rs
+codex-rs/core/src/tools/spec_plan.rs
+codex-rs/core/src/tools/spec_plan_tests.rs

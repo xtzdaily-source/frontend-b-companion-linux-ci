@@ -1,0 +1,786 @@
+diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
+index cf02f023cf..639b8e17a4 100644
+--- a/codex-rs/app-server/Cargo.toml
++++ b/codex-rs/app-server/Cargo.toml
+@@ -21,6 +21,9 @@ name = "codex_app_server"
+ path = "src/lib.rs"
+ doctest = false
+ 
++[features]
++execution-disabled-companion = ["codex-core/execution-disabled-companion"]
++
+ [lints]
+ workspace = true
+ 
+diff --git a/codex-rs/app-server/companion-exec-policy.example.toml b/codex-rs/app-server/companion-exec-policy.example.toml
+new file mode 100644
+index 0000000000..b12954a11c
+--- /dev/null
++++ b/codex-rs/app-server/companion-exec-policy.example.toml
+@@ -0,0 +1,23 @@
++# Installed as /etc/tidal-codex-poc/companion-exec-policy.toml.
++# Production requires root:root ownership and exact mode 0644.
++version = 1
++default_action = "deny"
++hosted_tools = "disabled"
++
++# Only registered/client-executed local runtimes belong here. Hard-denied
++# execution tools remain denied even if accidentally listed.
++allowed_local_tools = [
++  "current_time",
++  "get_context_remaining",
++  "list_mcp_resources",
++  "list_mcp_resource_templates",
++  "read_mcp_resource",
++  "tool_search",
++  "view_image",
++]
++
++# MCP identity matching is exact across server, raw tool, and connector.
++# An omitted connector means the runtime ToolInfo must have no connector id.
++[[allowed_mcp_tools]]
++server = "memory_search"
++raw_tool = "memory_search"
+diff --git a/codex-rs/app-server/src/main.rs b/codex-rs/app-server/src/main.rs
+index 4d5ab3f122..f67079beae 100644
+--- a/codex-rs/app-server/src/main.rs
++++ b/codex-rs/app-server/src/main.rs
+@@ -63,6 +63,9 @@ struct AppServerArgs {
+ }
+ 
+ fn main() -> anyhow::Result<()> {
++    #[cfg(feature = "execution-disabled-companion")]
++    codex_core::companion_execution_policy::initialize()?;
++
+     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
+     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {
+         let AppServerArgs {
+diff --git a/codex-rs/core/Cargo.toml b/codex-rs/core/Cargo.toml
+index 3eac8f03e6..9d028af3e9 100644
+--- a/codex-rs/core/Cargo.toml
++++ b/codex-rs/core/Cargo.toml
+@@ -8,6 +8,9 @@ version.workspace = true
+ name = "codex_core"
+ path = "src/lib.rs"
+ 
++[features]
++execution-disabled-companion = []
++
+ [[bin]]
+ name = "codex-write-config-schema"
+ path = "src/bin/config_schema.rs"
+diff --git a/codex-rs/core/src/companion_execution_policy.rs b/codex-rs/core/src/companion_execution_policy.rs
+new file mode 100644
+index 0000000000..3666ad51bd
+--- /dev/null
++++ b/codex-rs/core/src/companion_execution_policy.rs
+@@ -0,0 +1,270 @@
++//! Frozen execution policy for the execution-disabled companion build.
++//!
++//! Scope is deliberately narrow: this module authorizes only registered,
++//! client-executed runtimes dispatched by `ToolRegistry`. Hosted/provider tools
++//! have a separate default-off path in `spec_plan` and are not claimed here.
++
++use std::collections::HashSet;
++use std::fs;
++use std::path::Path;
++use std::sync::OnceLock;
++
++use anyhow::Context;
++use codex_tools::ToolName;
++use serde::Deserialize;
++
++pub const POLICY_PATH: &str = "/etc/tidal-codex-poc/companion-exec-policy.toml";
++pub(crate) const POLICY_DENIAL_CODE: &str = "execution_disabled_by_runtime_policy";
++const POLICY_VERSION: u32 = 1;
++
++static POLICY: OnceLock<ExecutionPolicy> = OnceLock::new();
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum RuntimeOrigin {
++    Local,
++    Mcp {
++        server: String,
++        raw_tool: String,
++        connector: Option<String>,
++    },
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct PolicyFile {
++    version: u32,
++    default_action: DefaultAction,
++    hosted_tools: HostedTools,
++    #[serde(default)]
++    allowed_local_tools: Vec<String>,
++    #[serde(default)]
++    allowed_mcp_tools: Vec<McpRule>,
++}
++
++#[derive(Debug, Deserialize, PartialEq, Eq)]
++#[serde(rename_all = "snake_case")]
++enum DefaultAction {
++    Deny,
++}
++
++#[derive(Debug, Deserialize, PartialEq, Eq)]
++#[serde(rename_all = "snake_case")]
++enum HostedTools {
++    Disabled,
++}
++
++#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash)]
++#[serde(deny_unknown_fields)]
++struct McpRule {
++    server: String,
++    raw_tool: String,
++    /// Omitted means the tool must have no connector identity.
++    connector: Option<String>,
++}
++
++#[derive(Debug)]
++pub(crate) struct ExecutionPolicy {
++    allowed_local_tools: HashSet<String>,
++    allowed_mcp_tools: HashSet<McpRule>,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum PolicyDenialReason {
++    NotInitialized,
++    HardDeny,
++    NotAllowed,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) struct PolicyDenial {
++    pub(crate) canonical_tool: String,
++    pub(crate) reason: PolicyDenialReason,
++}
++
++pub fn initialize() -> anyhow::Result<()> {
++    let policy = load_policy(Path::new(POLICY_PATH), RequiredOwner::Root)?;
++    POLICY
++        .set(policy)
++        .map_err(|_| anyhow::anyhow!("companion execution policy initialized more than once"))
++}
++
++pub(crate) fn authorize_registered_runtime(
++    tool_name: &ToolName,
++    origin: &RuntimeOrigin,
++) -> Result<(), PolicyDenial> {
++    let policy = POLICY.get().ok_or_else(|| PolicyDenial {
++        canonical_tool: canonical_name(tool_name),
++        reason: PolicyDenialReason::NotInitialized,
++    })?;
++    policy.authorize(tool_name, origin)
++}
++
++#[cfg(test)]
++pub(crate) fn authorize_with_policy_for_test(
++    policy: &ExecutionPolicy,
++    tool_name: &ToolName,
++    origin: &RuntimeOrigin,
++) -> Result<(), PolicyDenial> {
++    policy.authorize(tool_name, origin)
++}
++
++impl ExecutionPolicy {
++    fn authorize(&self, tool_name: &ToolName, origin: &RuntimeOrigin) -> Result<(), PolicyDenial> {
++        let canonical = canonical_name(tool_name);
++        if is_unconditionally_denied(&canonical) {
++            return Err(PolicyDenial {
++                canonical_tool: canonical,
++                reason: PolicyDenialReason::HardDeny,
++            });
++        }
++
++        let allowed = match origin {
++            RuntimeOrigin::Local => self.allowed_local_tools.contains(&canonical),
++            RuntimeOrigin::Mcp {
++                server,
++                raw_tool,
++                connector,
++            } => self.allowed_mcp_tools.contains(&McpRule {
++                server: server.clone(),
++                raw_tool: raw_tool.clone(),
++                connector: connector.clone(),
++            }),
++        };
++        allowed
++            .then_some(())
++            .ok_or(PolicyDenial {
++                canonical_tool: canonical,
++                reason: PolicyDenialReason::NotAllowed,
++            })
++    }
++}
++
++fn canonical_name(name: &ToolName) -> String {
++    name.to_string()
++}
++
++fn is_unconditionally_denied(name: &str) -> bool {
++    const EXACT: &[&str] = &[
++        "exec_command",
++        "shell_command",
++        "write_stdin",
++        "apply_patch",
++        "write_file",
++        "edit_file",
++        "delete_file",
++        "create_file",
++        "move_file",
++        "rename_file",
++        "mkdir",
++        "remove_file",
++        "remove_directory",
++        "spawn_agent",
++        "request_permissions",
++        "execute",
++        "wait",
++    ];
++    EXACT.contains(&name)
++        || name.ends_with(".exec_command")
++        || name.ends_with(".shell_command")
++        || name.ends_with(".write_stdin")
++        || name.ends_with(".apply_patch")
++        || name.ends_with(".spawn_agent")
++        || name.ends_with(".request_permissions")
++        || name.starts_with("code_mode.")
++        || name.starts_with("terminal.")
++        || name.starts_with("pty.")
++        || name.starts_with("filesystem.write")
++        || name.starts_with("filesystem.edit")
++        || name.starts_with("filesystem.delete")
++}
++
++#[derive(Clone, Copy)]
++enum RequiredOwner {
++    Root,
++    #[cfg(test)]
++    Ids { uid: u32, gid: u32 },
++}
++
++fn load_policy(path: &Path, owner: RequiredOwner) -> anyhow::Result<ExecutionPolicy> {
++    validate_file(path, owner)?;
++    let bytes = fs::read(path).with_context(|| format!("read policy {}", path.display()))?;
++    let policy_file: PolicyFile = toml::from_str(
++        std::str::from_utf8(&bytes).context("policy is not UTF-8")?,
++    )
++    .context("parse companion execution policy")?;
++    anyhow::ensure!(
++        policy_file.version == POLICY_VERSION,
++        "unknown policy version {}",
++        policy_file.version
++    );
++    anyhow::ensure!(
++        policy_file.default_action == DefaultAction::Deny,
++        "default_action must be deny"
++    );
++    anyhow::ensure!(
++        policy_file.hosted_tools == HostedTools::Disabled,
++        "hosted_tools must be disabled"
++    );
++    anyhow::ensure!(
++        policy_file
++            .allowed_mcp_tools
++            .iter()
++            .all(|rule| !rule.server.is_empty() && !rule.raw_tool.is_empty()),
++        "MCP rules require non-empty server and raw_tool"
++    );
++    Ok(ExecutionPolicy {
++        allowed_local_tools: policy_file.allowed_local_tools.into_iter().collect(),
++        allowed_mcp_tools: policy_file.allowed_mcp_tools.into_iter().collect(),
++    })
++}
++
++#[cfg(unix)]
++fn validate_file(path: &Path, owner: RequiredOwner) -> anyhow::Result<()> {
++    use std::os::unix::fs::MetadataExt;
++    let metadata = fs::symlink_metadata(path)
++        .with_context(|| format!("stat policy {}", path.display()))?;
++    let (required_uid, required_gid) = match owner {
++        RequiredOwner::Root => (0, 0),
++        #[cfg(test)]
++        RequiredOwner::Ids { uid, gid } => (uid, gid),
++    };
++    validate_metadata(
++        metadata.uid(),
++        metadata.gid(),
++        metadata.mode() & 0o777,
++        metadata.file_type().is_file(),
++        required_uid,
++        required_gid,
++    )
++}
++
++#[cfg(unix)]
++fn validate_metadata(
++    uid: u32,
++    gid: u32,
++    mode: u32,
++    is_regular_file: bool,
++    required_uid: u32,
++    required_gid: u32,
++) -> anyhow::Result<()> {
++    anyhow::ensure!(is_regular_file, "policy must be a regular file");
++    anyhow::ensure!(
++        uid == required_uid,
++        "policy owner uid must be {required_uid}"
++    );
++    anyhow::ensure!(
++        gid == required_gid,
++        "policy owner gid must be {required_gid}"
++    );
++    anyhow::ensure!(mode == 0o644, "policy mode must be exactly 0644");
++    Ok(())
++}
++
++#[cfg(not(unix))]
++fn validate_file(_path: &Path, _owner: RequiredOwner) -> anyhow::Result<()> {
++    anyhow::bail!("execution-disabled companion policy requires Unix ownership semantics")
++}
++
++#[cfg(test)]
++#[path = "companion_execution_policy_tests.rs"]
++pub(crate) mod tests;
+diff --git a/codex-rs/core/src/companion_execution_policy_tests.rs b/codex-rs/core/src/companion_execution_policy_tests.rs
+new file mode 100644
+index 0000000000..ee12d35ebb
+--- /dev/null
++++ b/codex-rs/core/src/companion_execution_policy_tests.rs
+@@ -0,0 +1,155 @@
++use super::*;
++use std::io::Write;
++
++fn policy(contents: &str) -> anyhow::Result<(tempfile::NamedTempFile, ExecutionPolicy)> {
++    use std::os::unix::fs::MetadataExt;
++    let mut file = tempfile::NamedTempFile::new()?;
++    file.write_all(contents.as_bytes())?;
++    use std::os::unix::fs::PermissionsExt;
++    file.as_file()
++        .set_permissions(fs::Permissions::from_mode(0o644))?;
++    let metadata = file.as_file().metadata()?;
++    let loaded = load_policy(
++        file.path(),
++        RequiredOwner::Ids {
++            uid: metadata.uid(),
++            gid: metadata.gid(),
++        },
++    )?;
++    Ok((file, loaded))
++}
++
++pub(crate) fn policy_for_registry() -> anyhow::Result<(tempfile::NamedTempFile, ExecutionPolicy)> {
++    policy(VALID)
++}
++
++const VALID: &str = r#"
++version = 1
++default_action = "deny"
++hosted_tools = "disabled"
++allowed_local_tools = ["view_image", "exec_command"]
++
++[[allowed_mcp_tools]]
++server = "memory_search"
++raw_tool = "memory_search"
++
++[[allowed_mcp_tools]]
++server = "future"
++raw_tool = "weather"
++connector = "connector-weather"
++"#;
++
++#[test]
++fn dangerous_local_tool_is_denied_even_if_listed() -> anyhow::Result<()> {
++    let (_file, policy) = policy(VALID)?;
++    assert_eq!(
++        policy.authorize(&ToolName::plain("exec_command"), &RuntimeOrigin::Local),
++        Err(PolicyDenial {
++            canonical_tool: "exec_command".to_string(),
++            reason: PolicyDenialReason::HardDeny,
++        })
++    );
++    assert_eq!(POLICY_DENIAL_CODE, "execution_disabled_by_runtime_policy");
++    Ok(())
++}
++
++#[test]
++fn unknown_local_runtime_is_denied_by_default() -> anyhow::Result<()> {
++    let (_file, policy) = policy(VALID)?;
++    assert!(
++        policy
++            .authorize(
++                &ToolName::plain("brand_new_runtime"),
++                &RuntimeOrigin::Local
++            )
++            .is_err()
++    );
++    Ok(())
++}
++
++#[test]
++fn mcp_identity_is_exact_and_policy_only_addition_can_allow_new_tool() -> anyhow::Result<()> {
++    let (_file, policy) = policy(VALID)?;
++    let memory = RuntimeOrigin::Mcp {
++        server: "memory_search".into(),
++        raw_tool: "memory_search".into(),
++        connector: None,
++    };
++    assert!(
++        policy
++            .authorize(
++                &ToolName::namespaced("mcp__memory_search", "memory_search"),
++                &memory
++            )
++            .is_ok()
++    );
++    let future = RuntimeOrigin::Mcp {
++        server: "future".into(),
++        raw_tool: "weather".into(),
++        connector: Some("connector-weather".into()),
++    };
++    assert!(
++        policy
++            .authorize(&ToolName::namespaced("future", "weather"), &future)
++            .is_ok()
++    );
++    let wrong_connector = RuntimeOrigin::Mcp {
++        connector: None,
++        ..future
++    };
++    assert!(
++        policy
++            .authorize(
++                &ToolName::namespaced("future", "weather"),
++                &wrong_connector
++            )
++            .is_err()
++    );
++    Ok(())
++}
++
++#[test]
++fn rejects_unknown_fields_versions_and_writable_mode() -> anyhow::Result<()> {
++    assert!(policy(&VALID.replace("version = 1", "version = 2")).is_err());
++    assert!(policy("this is not toml = [").is_err());
++    assert!(policy(&format!("{VALID}\nunknown = true\n")).is_err());
++    let (file, _) = policy(VALID)?;
++    let mut perms = file.as_file().metadata()?.permissions();
++    use std::os::unix::fs::PermissionsExt;
++    perms.set_mode(0o666);
++    file.as_file().set_permissions(perms)?;
++    use std::os::unix::fs::MetadataExt;
++    let metadata = file.as_file().metadata()?;
++    assert!(
++        load_policy(
++            file.path(),
++            RequiredOwner::Ids {
++                uid: metadata.uid(),
++                gid: metadata.gid(),
++            }
++        )
++        .is_err()
++    );
++    Ok(())
++}
++
++#[test]
++fn rejects_wrong_owner_non_regular_file_and_noncanonical_mode() {
++    assert!(validate_metadata(1000, 0, 0o644, true, 0, 0).is_err());
++    assert!(validate_metadata(0, 1000, 0o644, true, 0, 0).is_err());
++    assert!(validate_metadata(0, 0, 0o644, false, 0, 0).is_err());
++    assert!(validate_metadata(0, 0, 0o640, true, 0, 0).is_err());
++    assert!(validate_metadata(0, 0, 0o664, true, 0, 0).is_err());
++    assert!(validate_metadata(0, 0, 0o644, true, 0, 0).is_ok());
++}
++
++#[test]
++fn missing_policy_fails_closed() {
++    assert!(
++        load_policy(
++            Path::new("/definitely/missing/companion-policy.toml"),
++            RequiredOwner::Root
++        )
++        .is_err()
++    );
++}
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index e37c17ca5d..bbf0e4d886 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -24,6 +24,8 @@ mod compact_model_fallback;
+ mod compact_remote;
+ mod compact_remote_v2;
+ mod compact_token_budget;
++#[cfg(feature = "execution-disabled-companion")]
++pub mod companion_execution_policy;
+ mod config_lock;
+ pub use codex_thread::BackgroundTerminalInfo;
+ pub use codex_thread::CodexThread;
+diff --git a/codex-rs/core/src/tools/handlers/mcp.rs b/codex-rs/core/src/tools/handlers/mcp.rs
+index 7cadbcf0c3..faa4db19d4 100644
+--- a/codex-rs/core/src/tools/handlers/mcp.rs
++++ b/codex-rs/core/src/tools/handlers/mcp.rs
+@@ -164,6 +164,15 @@ impl McpHandler {
+ }
+ 
+ impl CoreToolRuntime for McpHandler {
++    #[cfg(feature = "execution-disabled-companion")]
++    fn execution_policy_origin(&self) -> crate::companion_execution_policy::RuntimeOrigin {
++        crate::companion_execution_policy::RuntimeOrigin::Mcp {
++            server: self.tool_info.server_name.clone(),
++            raw_tool: self.tool_info.tool.name.to_string(),
++            connector: self.tool_info.connector_id.clone(),
++        }
++    }
++
+     fn telemetry_tags<'a>(
+         &'a self,
+         _invocation: &'a ToolInvocation,
+diff --git a/codex-rs/core/src/tools/registry.rs b/codex-rs/core/src/tools/registry.rs
+index 3000c518ba..e2d72aa416 100644
+--- a/codex-rs/core/src/tools/registry.rs
++++ b/codex-rs/core/src/tools/registry.rs
+@@ -50,6 +50,11 @@ pub use codex_tools::ToolExposure;
+ /// Implementers provide the shared `ToolExecutor` behavior plus optional
+ /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
+ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
++    #[cfg(feature = "execution-disabled-companion")]
++    fn execution_policy_origin(&self) -> crate::companion_execution_policy::RuntimeOrigin {
++        crate::companion_execution_policy::RuntimeOrigin::Local
++    }
++
+     fn matches_kind(&self, payload: &ToolPayload) -> bool {
+         matches!(
+             payload,
+@@ -282,6 +287,11 @@ impl ToolExecutor<ToolInvocation> for ExposureOverride {
+ }
+ 
+ impl CoreToolRuntime for ExposureOverride {
++    #[cfg(feature = "execution-disabled-companion")]
++    fn execution_policy_origin(&self) -> crate::companion_execution_policy::RuntimeOrigin {
++        self.handler.execution_policy_origin()
++    }
++
+     fn matches_kind(&self, payload: &ToolPayload) -> bool {
+         self.handler.matches_kind(payload)
+     }
+@@ -482,6 +492,35 @@ impl ToolRegistry {
+             }
+         };
+ 
++        // This is the authoritative execution boundary for registered, locally
++        // handled tools. It intentionally runs before telemetry, lifecycle,
++        // hooks, approvals, sandbox setup, and the handler itself. Hosted tools
++        // are provider-executed specs and never enter ToolRegistry.
++        #[cfg(feature = "execution-disabled-companion")]
++        let policy_result = if cfg!(test) {
++            Ok(())
++        } else {
++            crate::companion_execution_policy::authorize_registered_runtime(
++                &tool_name,
++                &tool.execution_policy_origin(),
++            )
++        };
++        #[cfg(feature = "execution-disabled-companion")]
++        if let Err(denial) = policy_result {
++            tracing::warn!(
++                policy_error = crate::companion_execution_policy::POLICY_DENIAL_CODE,
++                canonical_tool = %denial.canonical_tool,
++                denial_reason = ?denial.reason,
++                runtime_origin = ?tool.execution_policy_origin(),
++                "execution-disabled companion rejected registered runtime before handler"
++            );
++            let err = FunctionCallError::RespondToModel(
++                crate::companion_execution_policy::POLICY_DENIAL_CODE.to_string(),
++            );
++            dispatch_trace.record_failed(&err);
++            return Err(err);
++        }
++
+         let telemetry_tags = tool.telemetry_tags(&invocation).await;
+         let mut tool_result_tags =
+             Vec::with_capacity(base_tool_result_tags.len() + telemetry_tags.len() + 1);
+diff --git a/codex-rs/core/src/tools/registry_tests.rs b/codex-rs/core/src/tools/registry_tests.rs
+index 12ab6b3f28..9b1269c6d5 100644
+--- a/codex-rs/core/src/tools/registry_tests.rs
++++ b/codex-rs/core/src/tools/registry_tests.rs
+@@ -6,6 +6,35 @@ struct TestHandler {
+     tool_name: codex_tools::ToolName,
+ }
+ 
++#[cfg(feature = "execution-disabled-companion")]
++struct CountingDangerousHandler {
++    calls: Arc<std::sync::atomic::AtomicUsize>,
++}
++
++#[cfg(feature = "execution-disabled-companion")]
++impl ToolExecutor<ToolInvocation> for CountingDangerousHandler {
++    fn tool_name(&self) -> codex_tools::ToolName {
++        codex_tools::ToolName::plain("exec_command")
++    }
++
++    fn spec(&self) -> codex_tools::ToolSpec {
++        test_spec(&self.tool_name())
++    }
++
++    fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
++        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++        Box::pin(async {
++            Ok(Box::new(crate::tools::context::FunctionToolOutput::from_text(
++                "must not run".to_string(),
++                Some(true),
++            )) as Box<dyn crate::tools::context::ToolOutput>)
++        })
++    }
++}
++
++#[cfg(feature = "execution-disabled-companion")]
++impl CoreToolRuntime for CountingDangerousHandler {}
++
+ impl ToolExecutor<ToolInvocation> for TestHandler {
+     fn tool_name(&self) -> codex_tools::ToolName {
+         self.tool_name.clone()
+@@ -179,6 +208,39 @@ fn handler_looks_up_namespaced_aliases_explicitly() {
+     );
+ }
+ 
++#[cfg(feature = "execution-disabled-companion")]
++#[tokio::test]
++async fn execution_policy_denies_visible_dangerous_schema_before_handler() -> anyhow::Result<()> {
++    let (_policy_file, policy) = crate::companion_execution_policy::tests::policy_for_registry()?;
++    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++    let handler = Arc::new(CountingDangerousHandler {
++        calls: Arc::clone(&calls),
++    });
++    let registry = ToolRegistry::with_handler_for_test(handler);
++    assert_eq!(
++        registry.tool_names_for_test(),
++        vec![codex_tools::ToolName::plain("exec_command")]
++    );
++    let (session, turn) = crate::session::tests::make_session_and_context().await;
++    let invocation = test_invocation(
++        Arc::new(session),
++        Arc::new(turn),
++        "denied-call",
++        codex_tools::ToolName::plain("exec_command"),
++    );
++    let tool = registry
++        .tool(&invocation.tool_name)
++        .expect("dangerous handler remains registered");
++    let result = crate::companion_execution_policy::authorize_with_policy_for_test(
++        &policy,
++        &invocation.tool_name,
++        &tool.execution_policy_origin(),
++    );
++    assert!(result.is_err());
++    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn function_tools_expose_default_hook_payloads_and_rewrites() -> anyhow::Result<()> {
+     let (session, turn) = crate::session::tests::make_session_and_context().await;
+diff --git a/codex-rs/core/src/tools/spec_plan.rs b/codex-rs/core/src/tools/spec_plan.rs
+index 5ff9e392f3..fe2497d4d5 100644
+--- a/codex-rs/core/src/tools/spec_plan.rs
++++ b/codex-rs/core/src/tools/spec_plan.rs
+@@ -300,34 +300,45 @@ fn spec_for_model_request(
+ 
+ #[instrument(level = "trace", skip_all)]
+ fn hosted_model_tool_specs(context: &CoreToolPlanContext<'_>) -> Vec<ToolSpec> {
+-    let turn_context = context.turn_context;
+-    // Responses Lite accepts schemas for client-executed tools, not hosted Responses tools.
+-    if turn_context.model_info.use_responses_lite {
++    #[cfg(feature = "execution-disabled-companion")]
++    {
++        // Hosted/provider-executed tools do not cross ToolRegistry's local
++        // dispatch boundary. v2 therefore keeps them closed independently.
++        let _ = context;
+         return Vec::new();
+     }
+ 
+-    let mut specs = Vec::new();
+-    let standalone_web_search_available = standalone_web_search_enabled(turn_context)
+-        && context
+-            .extension_tool_executors
+-            .iter()
+-            .any(|executor| executor.tool_name() == ToolName::namespaced("web", "run"));
+-    // `Some(Cached/Live/Disabled)` are the options for mode when standalone search is unavailable
+-    // and the provider supports hosted search. `None` prevents emitting a hosted search tool.
+-    let web_search_mode = (!standalone_web_search_available
+-        && turn_context.provider.capabilities().web_search)
+-        .then_some(turn_context.config.web_search_mode.value());
+-    let web_search_config = web_search_mode
+-        .as_ref()
+-        .and(turn_context.config.web_search_config.as_ref());
+-    if let Some(hosted_web_search_tool) = create_web_search_tool(WebSearchToolOptions {
+-        web_search_mode,
+-        web_search_config,
+-        web_search_tool_type: turn_context.model_info.web_search_tool_type,
+-    }) {
+-        specs.push(hosted_web_search_tool);
++    #[cfg(not(feature = "execution-disabled-companion"))]
++    {
++        let turn_context = context.turn_context;
++        // Responses Lite accepts schemas for client-executed tools, not hosted Responses tools.
++        if turn_context.model_info.use_responses_lite {
++            return Vec::new();
++        }
++
++        let mut specs = Vec::new();
++        let standalone_web_search_available = standalone_web_search_enabled(turn_context)
++            && context
++                .extension_tool_executors
++                .iter()
++                .any(|executor| executor.tool_name() == ToolName::namespaced("web", "run"));
++        // `Some(Cached/Live/Disabled)` are the options for mode when standalone search is unavailable
++        // and the provider supports hosted search. `None` prevents emitting a hosted search tool.
++        let web_search_mode = (!standalone_web_search_available
++            && turn_context.provider.capabilities().web_search)
++            .then_some(turn_context.config.web_search_mode.value());
++        let web_search_config = web_search_mode
++            .as_ref()
++            .and(turn_context.config.web_search_config.as_ref());
++        if let Some(hosted_web_search_tool) = create_web_search_tool(WebSearchToolOptions {
++            web_search_mode,
++            web_search_config,
++            web_search_tool_type: turn_context.model_info.web_search_tool_type,
++        }) {
++            specs.push(hosted_web_search_tool);
++        }
++        specs
+     }
+-    specs
+ }
+ 
+ pub(crate) fn search_tool_enabled(turn_context: &TurnContext) -> bool {
+diff --git a/codex-rs/core/src/tools/spec_plan_tests.rs b/codex-rs/core/src/tools/spec_plan_tests.rs
+index 87be4d9275..94b5d60eb4 100644
+--- a/codex-rs/core/src/tools/spec_plan_tests.rs
++++ b/codex-rs/core/src/tools/spec_plan_tests.rs
+@@ -1798,6 +1798,7 @@ async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools() {
+     }
+ }
+ 
++#[cfg(not(feature = "execution-disabled-companion"))]
+ #[tokio::test]
+ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates() {
+     let image_generation_tool = Arc::new(TestNamespaceExtensionTool {
+@@ -1925,3 +1926,14 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
+     .await;
+     unsupported_provider.assert_visible_lacks(&["web_search"]);
+ }
++
++#[cfg(feature = "execution-disabled-companion")]
++#[tokio::test]
++async fn execution_disabled_companion_keeps_hosted_tools_closed() {
++    let plan = probe(|turn| {
++        set_web_search_mode(turn, WebSearchMode::Live);
++        turn.model_info.web_search_tool_type = WebSearchToolType::TextAndImage;
++    })
++    .await;
++    plan.assert_visible_lacks(&["web_search"]);
++}
