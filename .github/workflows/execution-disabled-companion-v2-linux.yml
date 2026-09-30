@@ -17,7 +17,7 @@ jobs:
       GIT_TERMINAL_PROMPT: "0"
       SOURCE_COMMIT: e363b08c9175ac1cbe5893615dd2cb9ddf95043b
       PATCH_PATH: ci/execution-disabled-companion-v2/patches/execution-disabled-companion-v2.patch
-      PATCH_SHA256: 646c95f73c79e0a1b187cb660e735f33cd4b1859529c074114445bff0ee2d24e
+      PATCH_SHA256: e9063e1b63adaa1e2f711f1102fb9c426a8670ad72dfa1d65b6e23e6d73175fd
       FEATURE: execution-disabled-companion
 
     steps:
